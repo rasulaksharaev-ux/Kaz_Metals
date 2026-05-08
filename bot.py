@@ -3,6 +3,7 @@ import logging
 import psycopg2
 import psycopg2.extras
 import aiohttp
+import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
@@ -13,32 +14,31 @@ logger = logging.getLogger(__name__)
 # ===== Railway Variables =====
 # ВАЖНО: реальные токены/пароли не должны храниться в коде.
 # Их нужно указывать только в Railway -> Variables.
-def get_int_env(name: str, default: int = 0) -> int:
+def must_env(name: str) -> str:
     value = os.environ.get(name)
     if value is None or str(value).strip() == "":
-        return default
-    try:
-        return int(str(value).strip())
-    except ValueError:
-        logger.warning(f"Переменная {name} должна быть числом. Сейчас указано: {value!r}. Использую {default}.")
-        return default
+        raise RuntimeError(f"{name} не задан в Railway Variables!")
+    return str(value).strip()
 
-TOKEN = os.environ.get("BOT_TOKEN")
-GOLDAPI_KEY = os.environ.get("GOLDAPI_KEY", "")
-ADMIN_CHAT_ID = get_int_env("ADMIN_CHAT_ID", 0)
-ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "")
-GROUP_LINK = os.environ.get("GROUP_LINK", "")
-GROUP_ID = get_int_env("GROUP_ID", 0)
-MEDIA_CHANNEL_ID = get_int_env("MEDIA_CHANNEL_ID", 0)
-DATABASE_URL = os.environ.get("DATABASE_URL")
+def must_int_env(name: str) -> int:
+    value = must_env(name)
+    try:
+        return int(value)
+    except ValueError as e:
+        raise RuntimeError(f"{name} должен быть числом, получено: {value!r}") from e
+
+TOKEN = must_env("BOT_TOKEN")
+GOLDAPI_KEY = must_env("GOLDAPI_KEY")
+ADMIN_CHAT_ID = must_int_env("ADMIN_CHAT_ID")
+ADMIN_USERNAME = must_env("ADMIN_USERNAME")
+GROUP_LINK = must_env("GROUP_LINK")
+GROUP_ID = must_int_env("GROUP_ID")
+MEDIA_CHANNEL_ID = must_int_env("MEDIA_CHANNEL_ID")
+DATABASE_URL = must_env("DATABASE_URL")
 BOT_USERNAME = os.environ.get("BOT_USERNAME", "KAZ_METALSbot")
 MEDIA_CHANNEL_USERNAME = os.environ.get("MEDIA_CHANNEL_USERNAME", "kaz_metalsphoto")
 AUTO_PUBLISH_PRICES = os.environ.get("AUTO_PUBLISH_PRICES", "true").lower() in ("1", "true", "yes", "y")
 
-if not TOKEN:
-    raise RuntimeError("BOT_TOKEN не задан в Railway Variables!")
-if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL не задан в Railway Variables!")
 
 CATEGORIES = [
     "💍 Ювелирка",
@@ -335,40 +335,52 @@ async def show_ad_preview(update_or_msg, context, user_id):
         await context.bot.send_message(chat_id=chat_id, text=preview_text, reply_markup=keyboard)
 
 async def get_metal_prices():
+    """Источник цен: LBMA, курс USD/KZT: Нацбанк Казахстана."""
+    usd_kzt = None
     try:
-        usd_kzt = 520.0
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get("https://api.exchangerate-api.com/v4/latest/USD") as r:
-                    data = await r.json()
-                    usd_kzt = data.get("rates", {}).get("KZT", 520.0)
-        except Exception:
-            pass
-
-        metals = {
-            "XAU": ("🥇 Золото", "г"),
-            "XAG": ("🥈 Серебро", "г"),
-            "XPT": ("💎 Платина", "г"),
-            "XPD": ("🔩 Палладий", "г"),
-        }
-        results = {}
-        if not GOLDAPI_KEY:
-            return results, round(usd_kzt)
         async with aiohttp.ClientSession() as session:
-            for symbol, (name, unit) in metals.items():
-                try:
-                    url = f"https://www.goldapi.io/api/{symbol}/USD"
-                    headers = {"x-access-token": GOLDAPI_KEY, "Content-Type": "application/json"}
-                    async with session.get(url, headers=headers) as r:
-                        data = await r.json()
-                        price_usd_oz = data.get("price", 0)
-                        price_kzt_g = (price_usd_oz / 31.1035) * usd_kzt
-                        results[symbol] = (name, round(price_kzt_g), unit)
-                except Exception:
-                    pass
-        return results, round(usd_kzt)
-    except Exception:
-        return {}, 520
+            async with session.get("https://nationalbank.kz/rss/rates_all.xml", timeout=20) as r:
+                xml_text = await r.text()
+        root = ET.fromstring(xml_text)
+        for item in root.findall(".//item"):
+            title = (item.findtext("title") or "").strip()
+            if title.upper() == "USD":
+                description = (item.findtext("description") or "").replace(",", ".").strip()
+                quant = (item.findtext("quant") or "1").strip()
+                usd_kzt = float(description) / max(float(quant), 1.0)
+                break
+    except Exception as e:
+        logger.error(f"NBRK FX fetch error: {e}")
+
+    # LBMA публикует значения в USD/oz. Если источник временно недоступен, не возвращаем нули.
+    prices_oz = {}
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get("https://prices.lbma.org.uk/json/latest.json", timeout=20) as r:
+                data = await r.json(content_type=None)
+        prices_oz = {
+            "XAU": float(data.get("gold_usd", 0) or 0),
+            "XAG": float(data.get("silver_usd", 0) or 0),
+            "XPT": float(data.get("platinum_usd", 0) or 0),
+            "XPD": float(data.get("palladium_usd", 0) or 0),
+        }
+    except Exception as e:
+        logger.error(f"LBMA fetch error: {e}")
+
+    metals = {
+        "XAU": ("🥇 Золото", "г"),
+        "XAG": ("🥈 Серебро", "г"),
+        "XPT": ("💎 Платина", "г"),
+        "XPD": ("🔩 Палладий", "г"),
+    }
+    results = {}
+    if usd_kzt and prices_oz:
+        for symbol, (name, unit) in metals.items():
+            price_usd_oz = prices_oz.get(symbol, 0)
+            if price_usd_oz > 0:
+                price_kzt_g = (price_usd_oz / 31.1035) * usd_kzt
+                results[symbol] = (name, round(price_kzt_g), unit)
+    return results, round(usd_kzt) if usd_kzt else 0
 
 def main_menu_keyboard():
     return InlineKeyboardMarkup([
